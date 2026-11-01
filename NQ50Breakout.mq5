@@ -6,29 +6,30 @@
 //| Session:   24 hours, no clock filter                             |
 //| Long:      buy stop at the highest high of the last 50 bars      |
 //| Short:     sell stop at the lowest low of the last 50 bars       |
-//| Exit:      close at the next M30 bar's open                     |
+//| Exit:      close at the next signal bar's open                  |
 //| Stop loss: 1000 account currency per trade                      |
 //| Cap:       2 entries per day                                     |
 //|                                                                  |
-//| The channel uses the last 50 closed M30 bars. The current bar    |
-//| is not included. If the bar opens already through a level, the  |
-//| stop is filled at the market, which is the gap-through fill.    |
+//| The channel uses the last 50 closed bars of the signal timeframe.|
+//| The forming bar is not included. A gap through a level fills    |
+//| at the market.                                                   |
 //| A fill cancels the opposite stop. The cash stop can close the   |
 //| trade before the next bar. A stopped-out trade is not re-entered |
 //| until the following bar.                                         |
 //|                                                                  |
-//| Test on M30 or lower (M1 is fine). Use 1-minute OHLC or real    |
-//| ticks so stop orders can fill inside the 30-minute bar.         |
+//| Test on the signal timeframe or lower (M1 is fine). Use         |
+//| 1-minute OHLC or real ticks so stops can fill inside the bar.   |
 //+------------------------------------------------------------------+
 #property copyright "Onlybreakout"
-#property version   "1.00"
-#property description "50-bar M30 breakout. Buy stop at the 50-bar high, sell stop at the 50-bar low."
-#property description "Exit at the next M30 open. Stop is 1000 account currency. Max 2 entries per day."
+#property version   "1.01"
+#property description "50-bar breakout. Buy stop at the channel high, sell stop at the channel low."
+#property description "Exit at the next bar open. Stop is 1000 account currency. Max 2 entries per day."
 
 #include <Trade/Trade.mqh>
 
 input group "=== Strategy ==="
-input int    InpLookback           = 50;      // Closed M30 bars in the channel
+input ENUM_TIMEFRAMES InpTimeframe = PERIOD_M30; // Signal timeframe
+input int    InpLookback           = 50;      // Closed bars in the channel
 input double InpStopLossMoney      = 1000.0;  // Stop loss per trade, account currency
 input int    InpMaxEntriesPerDay   = 2;       // Max entries per day
 input int    InpDayResetHour       = 0;       // Day starts at this hour, server time
@@ -39,7 +40,8 @@ input ulong  InpMagic              = 50302026;
 input int    InpSlippageTicks      = 10;      // Max slippage, ticks
 input bool   InpRemoveStopsOnRemove = true;   // Delete resting stops when the EA is removed
 
-CTrade   g_trade;
+CTrade            g_trade;
+ENUM_TIMEFRAMES   g_tf = PERIOD_M30;
 datetime g_ordersBar       = 0;
 datetime g_seenBar         = 0;
 datetime g_capLoggedDay    = 0;
@@ -53,15 +55,22 @@ int OnInit()
       return INIT_PARAMETERS_INCORRECT;
    if(InpDayResetHour < 0 || InpDayResetHour > 23)
       return INIT_PARAMETERS_INCORRECT;
-   // Signals always use closed M30 bars. M1 (or any period up to M30) is valid:
-   // the tester builds the M30 series from that period. A higher chart cannot.
-   if(PeriodSeconds(Period()) > PeriodSeconds(PERIOD_M30))
+   g_tf = (InpTimeframe == PERIOD_CURRENT) ? Period() : InpTimeframe;
+   if(PeriodSeconds(g_tf) <= 0)
    {
-      Print("NQ50Breakout reads M30 bars. Run the test on M30 or a lower timeframe. Current period is ", EnumToString(Period()), ".");
+      Print("Signal timeframe is not a candle period.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+   // The tester builds the signal bars from the chart period. A higher chart cannot.
+   if(PeriodSeconds(Period()) > PeriodSeconds(g_tf))
+   {
+      Print("Signal timeframe is ", EnumToString(g_tf),
+            ". Run the test on ", EnumToString(g_tf),
+            " or a lower timeframe. Current period is ", EnumToString(Period()), ".");
       return INIT_FAILED;
    }
-   if(Period() != PERIOD_M30)
-      Print("Chart is ", EnumToString(Period()), ". Entries and exits still follow M30 bars.");
+   if(Period() != g_tf)
+      Print("Chart is ", EnumToString(Period()), ". Entries and exits follow ", EnumToString(g_tf), " bars.");
 
    g_ordersBar = 0;
    g_seenBar = 0;
@@ -72,7 +81,7 @@ int OnInit()
 
    Print("NQ50Breakout on ", _Symbol,
          ". Channel ", InpLookback,
-         " M30 bars, stop ", DoubleToString(InpStopLossMoney, 2),
+         " ", EnumToString(g_tf), " bars, stop ", DoubleToString(InpStopLossMoney, 2),
          " account currency, max ", InpMaxEntriesPerDay,
          " entries/day, day resets at ", IntegerToString(InpDayResetHour),
          ":00 server time. 24-hour session.");
@@ -112,7 +121,7 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   const datetime bar = iTime(_Symbol, PERIOD_M30, 0);
+   const datetime bar = iTime(_Symbol, g_tf, 0);
    if(bar <= 0)
       return;
 
@@ -385,14 +394,14 @@ bool StopPriceFor(const ENUM_ORDER_TYPE side, const double entry, double &sl)
 //+------------------------------------------------------------------+
 bool Channel(double &hh, double &ll)
 {
-   if(Bars(_Symbol, PERIOD_M30) < InpLookback + 1)
+   if(Bars(_Symbol, g_tf) < InpLookback + 1)
       return false;
-   const int hi = iHighest(_Symbol, PERIOD_M30, MODE_HIGH, InpLookback, 1);
-   const int lo = iLowest(_Symbol, PERIOD_M30, MODE_LOW, InpLookback, 1);
+   const int hi = iHighest(_Symbol, g_tf, MODE_HIGH, InpLookback, 1);
+   const int lo = iLowest(_Symbol, g_tf, MODE_LOW, InpLookback, 1);
    if(hi < 0 || lo < 0)
       return false;
-   hh = iHigh(_Symbol, PERIOD_M30, hi);
-   ll = iLow(_Symbol, PERIOD_M30, lo);
+   hh = iHigh(_Symbol, g_tf, hi);
+   ll = iLow(_Symbol, g_tf, lo);
    return (hh > ll && hh > 0.0 && ll > 0.0);
 }
 
@@ -521,7 +530,7 @@ void CloseIfHeldFromPriorBar(const datetime barOpen)
       if((datetime)PositionGetInteger(POSITION_TIME) >= barOpen)
          continue;
       if(g_trade.PositionClose(tickets[i]))
-         Print("NQ50 exit at M30 open. Ticket ", (string)tickets[i],
+         Print("NQ50 exit at ", EnumToString(g_tf), " open. Ticket ", (string)tickets[i],
                " price ", DoubleToString(g_trade.ResultPrice(), DigitsSym()));
       else
          LogOnce("Exit failed ticket " + (string)tickets[i] + ": " + g_trade.ResultRetcodeDescription());
@@ -693,7 +702,7 @@ void RefreshBreakoutOrders(bool &retry)
    if(!Channel(hh, ll))
    {
       retry = true;
-      LogOnce("Waiting for " + IntegerToString(InpLookback) + " closed M30 bars.");
+      LogOnce("Waiting for " + IntegerToString(InpLookback) + " closed " + EnumToString(g_tf) + " bars.");
       return;
    }
 
@@ -786,7 +795,7 @@ void UpdateComment(const datetime bar)
 
    string action = "Waiting for the channel";
    if(HasOurPosition())
-      action = "Exit at the next M30 open, unless the stop is hit first";
+      action = "Exit at the next " + EnumToString(g_tf) + " open, unless the stop is hit first";
    else if(EntriesToday() >= InpMaxEntriesPerDay)
       action = "Daily entry cap reached";
    else if(haveChannel && g_ordersBar == bar)
@@ -794,7 +803,7 @@ void UpdateComment(const datetime bar)
    else if(haveChannel)
       action = "Placing stops";
 
-   Comment("NQ 50-bar breakout  M30  24h\n",
+   Comment("NQ 50-bar breakout  ", EnumToString(g_tf), "  24h\n",
            "Buy stop   ", (haveChannel ? DoubleToString(hh, DigitsSym()) : "-"), "\n",
            "Sell stop  ", (haveChannel ? DoubleToString(ll, DigitsSym()) : "-"), "\n",
            "Entries today  ", IntegerToString(EntriesToday()), " / ", IntegerToString(InpMaxEntriesPerDay), "\n",
