@@ -1,12 +1,13 @@
 //+------------------------------------------------------------------+
 //| NQ50Breakout.mq5                                                 |
-//| 50-bar breakout, long and short, exit at the next bar open.     |
+//| 50-bar breakout. Direction is an input. Exit only in profit.    |
 //|                                                                  |
 //| Market:    NASDAQ index (US100, NQ, or the broker's symbol)     |
 //| Session:   24 hours, no clock filter                             |
 //| Long:      buy stop at the highest high of the last 50 bars      |
 //| Short:     sell stop at the lowest low of the last 50 bars       |
-//| Exit:      close at the next signal bar's open                  |
+//| Direction: long only, short only, or both                       |
+//| Exit:      after the entry bar has closed, only while in profit |
 //| Stop loss: 1000 account currency per trade                      |
 //| Cap:       2 entries per day                                     |
 //|                                                                  |
@@ -21,16 +22,17 @@
 //| 1-minute OHLC or real ticks so stops can fill inside the bar.   |
 //+------------------------------------------------------------------+
 #property copyright "Onlybreakout"
-#property version   "1.07"
+#property version   "1.10"
 #property description "50-bar breakout. Buy stop at the channel high, sell stop at the channel low."
-#property description "Exit at the next bar open. Stop is 1000 account currency. Max 2 entries per day."
+#property description "Direction is long only, short only, or both. Exit only while in profit."
 
 #include <Trade/Trade.mqh>
 
-enum ENUM_NQ_EXIT
+enum ENUM_NQ_DIRECTION
 {
-   NQ_EXIT_PROFIT = 0, // Profit only
-   NQ_EXIT_RAW    = 1  // Raw
+   NQ_DIR_LONG  = 0, // Long only
+   NQ_DIR_SHORT = 1, // Short only
+   NQ_DIR_BOTH  = 2  // Both directions
 };
 
 input group "=== Strategy ==="
@@ -39,7 +41,7 @@ input int    InpLookback           = 50;      // Closed bars in the channel
 input double InpStopLossMoney      = 1000.0;  // Stop loss per trade, account currency
 input int    InpMaxEntriesPerDay   = 2;       // Max entries per day
 input int    InpDayResetHour       = 0;       // Day starts at this hour, server time
-input ENUM_NQ_EXIT InpExitMode     = NQ_EXIT_RAW; // Exit mode
+input ENUM_NQ_DIRECTION InpDirection = NQ_DIR_BOTH; // Trade direction
 
 input group "=== Trade ==="
 input double InpLots               = 1.0;     // Volume, lots
@@ -64,9 +66,10 @@ double   g_frozenLots      = -1.0;
 string   g_lastLog         = "";
 
 // Equity sizing is applied to the stop and the lot input. It is not an input.
-const double EQUITY_BASE  = 180000.0;
-const double EQUITY_UNIT  = 6000.0;
-const double SIZE_FACTOR  = 0.35;
+const double EQUITY_BASE = 180000.0;
+const double EQUITY_CAP  = 190000.0;
+const double EQUITY_UNIT = 6000.0;
+const double SIZE_FACTOR = 0.35;
 
 //+------------------------------------------------------------------+
 double EquityRatio()
@@ -77,7 +80,10 @@ double EquityRatio()
 //+------------------------------------------------------------------+
 double SizeFactor()
 {
-   const double ratio = EquityRatio();
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   if(equity > EQUITY_CAP)
+      equity = EQUITY_CAP;
+   const double ratio = (equity - EQUITY_BASE) / EQUITY_UNIT;
    if(ratio <= 0.0)
       return 0.0;
    return ratio * SIZE_FACTOR;
@@ -87,6 +93,28 @@ double SizeFactor()
 double EffectiveLotsRaw()
 {
    return InpLots * SizeFactor();
+}
+
+//+------------------------------------------------------------------+
+bool AllowBuy()
+{
+   return (InpDirection == NQ_DIR_LONG || InpDirection == NQ_DIR_BOTH);
+}
+
+//+------------------------------------------------------------------+
+bool AllowSell()
+{
+   return (InpDirection == NQ_DIR_SHORT || InpDirection == NQ_DIR_BOTH);
+}
+
+//+------------------------------------------------------------------+
+string DirectionText()
+{
+   if(InpDirection == NQ_DIR_LONG)
+      return "Long only";
+   if(InpDirection == NQ_DIR_SHORT)
+      return "Short only";
+   return "Both directions";
 }
 
 //+------------------------------------------------------------------+
@@ -135,10 +163,11 @@ int OnInit()
          ". Channel ", g_lookback, " ", EnumToString(g_tf),
          " bars, max ", g_maxEntries,
          " entries/day, day resets at ", g_dayReset, ":00.",
-         " Stop is the previous candle. Exit mode ",
-         (InpExitMode == NQ_EXIT_RAW ? "Raw" : "Profit only"),
+         " Direction ", DirectionText(),
+         ". Stop is the previous candle. Exit only in profit",
          ". Equity ", DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2),
          ", ratio ", DoubleToString(EquityRatio(), 3),
+         ", factor ", DoubleToString(SizeFactor(), 3),
          ", lots ", DoubleToString(EffectiveLotsRaw(), 2),
          " from input ", DoubleToString(InpLots, 2), ".");
    return INIT_SUCCEEDED;
@@ -197,6 +226,12 @@ bool ResizeWorkingStops()
       double sl = 0.0;
       if(!StopPriceFor(side, price, sl))
          return false;
+      if((side == ORDER_TYPE_BUY && !AllowBuy()) || (side == ORDER_TYPE_SELL && !AllowSell()))
+      {
+         if(!g_trade.OrderDelete(tickets[i]))
+            return false;
+         continue;
+      }
       const double vol = OrderGetDouble(ORDER_VOLUME_CURRENT);
       const double curSl = OrderGetDouble(ORDER_SL);
       if(MathAbs(vol - lots) <= 1e-8 && MathAbs(curSl - sl) < TickSize() * 0.5)
@@ -596,6 +631,15 @@ void DeleteOurPendings()
 }
 
 //+------------------------------------------------------------------+
+void DeletePendingType(const ENUM_ORDER_TYPE type)
+{
+   ulong tickets[];
+   OurOrders(tickets, type);
+   for(int i = 0; i < ArraySize(tickets); i++)
+      g_trade.OrderDelete(tickets[i]);
+}
+
+//+------------------------------------------------------------------+
 ulong FindPending(const ENUM_ORDER_TYPE type)
 {
    ulong tickets[];
@@ -620,21 +664,17 @@ void CloseIfHeldFromPriorBar(const datetime barOpen)
       if(opened >= barOpen)
          continue;
 
-      if(InpExitMode == NQ_EXIT_PROFIT)
-      {
-         // The candle after the entry bar must have closed. A later close can still take profit.
-         const int shift = iBarShift(_Symbol, g_tf, opened, false);
-         if(shift < 2)
-            continue;
-         const double pnl = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
-         if(pnl <= 0.0)
-            continue;
-      }
+      // The candle after the entry bar must have closed. A later close can still take profit.
+      const int shift = iBarShift(_Symbol, g_tf, opened, false);
+      if(shift < 2)
+         continue;
+      const double pnl = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+      if(pnl <= 0.0)
+         continue;
 
       if(g_trade.PositionClose(tickets[i]))
-         Print("NQ50 exit at ", EnumToString(g_tf), " ",
-               (InpExitMode == NQ_EXIT_RAW ? "open" : "close, in profit"),
-               ". Ticket ", (string)tickets[i],
+         Print("NQ50 exit at ", EnumToString(g_tf), " close, in profit. Ticket ",
+               (string)tickets[i],
                " price ", DoubleToString(g_trade.ResultPrice(), DigitsSym()));
       else
          LogOnce("Exit failed ticket " + (string)tickets[i] + ": " + g_trade.ResultRetcodeDescription());
@@ -828,26 +868,43 @@ void RefreshBreakoutOrders(bool &retry)
    const bool buyThrough = (ask >= buyLevel);
    const bool sellThrough = (bid <= sellLevel);
 
-   if(buyThrough && sellThrough)
+   const bool wantBuy = AllowBuy();
+   const bool wantSell = AllowSell();
+
+   if(wantBuy && wantSell && buyThrough && sellThrough)
    {
       DeleteOurPendings();
       LogOnce("Bid/ask is through both channel edges. No entry this bar.");
       return;
    }
 
-   if(buyThrough || sellThrough)
+   if(wantBuy && buyThrough)
    {
       DeleteOurPendings();
-      SendMarket(buyThrough ? ORDER_TYPE_BUY : ORDER_TYPE_SELL, retry);
+      SendMarket(ORDER_TYPE_BUY, retry);
+      return;
+   }
+   if(wantSell && sellThrough)
+   {
+      DeleteOurPendings();
+      SendMarket(ORDER_TYPE_SELL, retry);
       return;
    }
 
    bool buyRetry = false;
    bool sellRetry = false;
-   EnsureStop(ORDER_TYPE_BUY_STOP, buyLevel, buyRetry);
-   // A buy stop can fill before the sell stop is sent. Do not rest the other side once we are in.
+   if(wantBuy)
+      EnsureStop(ORDER_TYPE_BUY_STOP, buyLevel, buyRetry);
+   else
+      DeletePendingType(ORDER_TYPE_BUY_STOP);
+   // A stop can fill before the other side is sent. Do not rest the other side once we are in.
    if(!HasOurPosition())
-      EnsureStop(ORDER_TYPE_SELL_STOP, sellLevel, sellRetry);
+   {
+      if(wantSell)
+         EnsureStop(ORDER_TYPE_SELL_STOP, sellLevel, sellRetry);
+      else
+         DeletePendingType(ORDER_TYPE_SELL_STOP);
+   }
    if(HasOurPosition())
       DeleteOurPendings();
    retry = buyRetry || sellRetry;
@@ -903,22 +960,22 @@ void UpdateComment(const datetime bar)
 
    string action = "Waiting for the channel";
    if(HasOurPosition())
-      action = (InpExitMode == NQ_EXIT_RAW)
-               ? "Exit when the next bar opens, unless the stop is hit first"
-               : "Exit on a later bar open only while in profit, unless the stop is hit first";
+      action = "Exit on a later bar open only while in profit, unless the stop is hit first";
    else if(EntriesToday() >= g_maxEntries)
       action = "Daily entry cap reached";
    else if(haveChannel && g_ordersBar == bar)
-      action = "Buy and sell stops are working";
+      action = AllowBuy() && AllowSell() ? "Buy and sell stops are working"
+             : (AllowBuy() ? "Buy stop is working" : "Sell stop is working");
    else if(haveChannel)
       action = "Placing stops";
 
-   Comment(EnumToString(g_tf), "  equity ", DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 0),
+   Comment(EnumToString(g_tf), "  ", DirectionText(),
+           "  equity ", DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 0),
            "  ratio ", DoubleToString(EquityRatio(), 2), "\n",
            "Lots ", DoubleToString(NormalizedLots(), 2),
            " (input ", DoubleToString(InpLots, 2), ")",
            "   SL previous candle",
-           "   exit ", (InpExitMode == NQ_EXIT_RAW ? "Raw" : "Profit only"), "\n",
+           "   exit Profit only\n",
            "Buy stop   ", (haveChannel ? DoubleToString(hh, DigitsSym()) : "-"), "\n",
            "Sell stop  ", (haveChannel ? DoubleToString(ll, DigitsSym()) : "-"), "\n",
            "Entries today  ", IntegerToString(EntriesToday()), " / ", IntegerToString(g_maxEntries), "\n",
