@@ -21,11 +21,17 @@
 //| 1-minute OHLC or real ticks so stops can fill inside the bar.   |
 //+------------------------------------------------------------------+
 #property copyright "Onlybreakout"
-#property version   "1.01"
+#property version   "1.06"
 #property description "50-bar breakout. Buy stop at the channel high, sell stop at the channel low."
 #property description "Exit at the next bar open. Stop is 1000 account currency. Max 2 entries per day."
 
 #include <Trade/Trade.mqh>
+
+enum ENUM_NQ_EXIT
+{
+   NQ_EXIT_PROFIT = 0, // Profit only
+   NQ_EXIT_RAW    = 1  // Raw
+};
 
 input group "=== Strategy ==="
 input ENUM_TIMEFRAMES InpTimeframe = PERIOD_M30; // Signal timeframe
@@ -33,6 +39,7 @@ input int    InpLookback           = 50;      // Closed bars in the channel
 input double InpStopLossMoney      = 1000.0;  // Stop loss per trade, account currency
 input int    InpMaxEntriesPerDay   = 2;       // Max entries per day
 input int    InpDayResetHour       = 0;       // Day starts at this hour, server time
+input ENUM_NQ_EXIT InpExitMode     = NQ_EXIT_RAW; // Exit mode
 
 input group "=== Trade ==="
 input double InpLots               = 1.0;     // Volume, lots
@@ -41,12 +48,44 @@ input int    InpSlippageTicks      = 10;      // Max slippage, ticks
 input bool   InpRemoveStopsOnRemove = true;   // Delete resting stops when the EA is removed
 
 CTrade            g_trade;
-ENUM_TIMEFRAMES   g_tf = PERIOD_M30;
+ENUM_TIMEFRAMES   g_tf           = PERIOD_M30;
+int               g_lookback     = 50;
+int               g_maxEntries   = 2;
+int               g_dayReset     = 0;
+ulong             g_magic        = 50302026;
+int               g_slippage     = 10;
+bool              g_removeStops  = true;
 datetime g_ordersBar       = 0;
 datetime g_seenBar         = 0;
 datetime g_capLoggedDay    = 0;
+double   g_sentLots        = -1.0;
 string   g_lastLog         = "";
-bool     g_loggedRisk      = false;
+
+// Equity sizing is applied to the stop and the lot input. It is not an input.
+const double EQUITY_BASE  = 180000.0;
+const double EQUITY_UNIT  = 6000.0;
+const double SIZE_FACTOR  = 0.35;
+
+//+------------------------------------------------------------------+
+double EquityRatio()
+{
+   return (AccountInfoDouble(ACCOUNT_EQUITY) - EQUITY_BASE) / EQUITY_UNIT;
+}
+
+//+------------------------------------------------------------------+
+double SizeFactor()
+{
+   const double ratio = EquityRatio();
+   if(ratio <= 0.0)
+      return 0.0;
+   return ratio * SIZE_FACTOR;
+}
+
+//+------------------------------------------------------------------+
+double EffectiveLotsRaw()
+{
+   return InpLots * SizeFactor();
+}
 
 //+------------------------------------------------------------------+
 int OnInit()
@@ -55,14 +94,23 @@ int OnInit()
       return INIT_PARAMETERS_INCORRECT;
    if(InpDayResetHour < 0 || InpDayResetHour > 23)
       return INIT_PARAMETERS_INCORRECT;
+
    g_tf = (InpTimeframe == PERIOD_CURRENT) ? Period() : InpTimeframe;
+   g_lookback = InpLookback;
+   g_maxEntries = InpMaxEntriesPerDay;
+   g_dayReset = InpDayResetHour;
+   g_magic = InpMagic;
+   g_slippage = InpSlippageTicks;
+   g_removeStops = InpRemoveStopsOnRemove;
+
    if(PeriodSeconds(g_tf) <= 0)
    {
       Print("Signal timeframe is not a candle period.");
       return INIT_PARAMETERS_INCORRECT;
    }
-   // The tester builds the signal bars from the chart period. A higher chart cannot.
-   if(PeriodSeconds(Period()) > PeriodSeconds(g_tf))
+   // The tester cannot build the signal bars from a higher test period.
+   // A live chart can: ticks still arrive, and the signal series is read directly.
+   if(MQLInfoInteger(MQL_TESTER) && PeriodSeconds(Period()) > PeriodSeconds(g_tf))
    {
       Print("Signal timeframe is ", EnumToString(g_tf),
             ". Run the test on ", EnumToString(g_tf),
@@ -75,16 +123,20 @@ int OnInit()
    g_ordersBar = 0;
    g_seenBar = 0;
    g_capLoggedDay = 0;
+   g_sentLots = -1.0;
    g_lastLog = "";
-   g_loggedRisk = false;
    ConfigureTrade();
 
    Print("NQ50Breakout on ", _Symbol,
-         ". Channel ", InpLookback,
-         " ", EnumToString(g_tf), " bars, stop ", DoubleToString(InpStopLossMoney, 2),
-         " account currency, max ", InpMaxEntriesPerDay,
-         " entries/day, day resets at ", IntegerToString(InpDayResetHour),
-         ":00 server time. 24-hour session.");
+         ". Channel ", g_lookback, " ", EnumToString(g_tf),
+         " bars, max ", g_maxEntries,
+         " entries/day, day resets at ", g_dayReset, ":00.",
+         " Stop is the previous candle. Exit mode ",
+         (InpExitMode == NQ_EXIT_RAW ? "Raw" : "Profit only"),
+         ". Equity ", DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2),
+         ", ratio ", DoubleToString(EquityRatio(), 3),
+         ", lots ", DoubleToString(EffectiveLotsRaw(), 2),
+         " from input ", DoubleToString(InpLots, 2), ".");
    return INIT_SUCCEEDED;
 }
 
@@ -94,7 +146,7 @@ void OnDeinit(const int reason)
    Comment("");
    ObjectDelete(0, "NQ50_High");
    ObjectDelete(0, "NQ50_Low");
-   if(InpRemoveStopsOnRemove)
+   if(g_removeStops)
       DeleteOurPendings();
 }
 
@@ -109,13 +161,54 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
       return;
    if(HistoryDealGetString(trans.deal, DEAL_SYMBOL) != _Symbol)
       return;
-   if((ulong)HistoryDealGetInteger(trans.deal, DEAL_MAGIC) != InpMagic)
+   if((ulong)HistoryDealGetInteger(trans.deal, DEAL_MAGIC) != g_magic)
       return;
    if(HistoryDealGetInteger(trans.deal, DEAL_ENTRY) != DEAL_ENTRY_IN)
       return;
 
    // One position at a time: the opposite breakout stop is cancelled as soon as this one fills.
    DeleteOurPendings();
+}
+
+//+------------------------------------------------------------------+
+bool ResizeWorkingStops()
+{
+   const double lots = NormalizedLots();
+   if(lots <= 0.0)
+      return false;
+
+   ulong tickets[];
+   const int n = OurOrders(tickets, -1);
+   if(n == 0)
+      return false;
+
+   for(int i = 0; i < n; i++)
+   {
+      if(!OrderSelect(tickets[i]))
+         return false;
+      const double price = OrderGetDouble(ORDER_PRICE_OPEN);
+      const ENUM_ORDER_TYPE type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+      const ENUM_ORDER_TYPE side = (type == ORDER_TYPE_BUY_STOP || type == ORDER_TYPE_BUY_LIMIT || type == ORDER_TYPE_BUY)
+                                   ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+      double sl = 0.0;
+      if(!StopPriceFor(side, price, sl))
+         return false;
+      const double vol = OrderGetDouble(ORDER_VOLUME_CURRENT);
+      const double curSl = OrderGetDouble(ORDER_SL);
+      if(MathAbs(vol - lots) <= 1e-8 && MathAbs(curSl - sl) < TickSize() * 0.5)
+         continue;
+      if(!g_trade.OrderDelete(tickets[i]))
+         return false;
+      const bool ok = (side == ORDER_TYPE_BUY)
+                      ? g_trade.BuyStop(lots, price, _Symbol, sl, 0.0, ORDER_TIME_GTC, 0, "NQ50 buy stop")
+                      : g_trade.SellStop(lots, price, _Symbol, sl, 0.0, ORDER_TIME_GTC, 0, "NQ50 sell stop");
+      if(!ok)
+      {
+         LogOnce("NQ50 size update failed: " + g_trade.ResultRetcodeDescription());
+         return false;
+      }
+   }
+   return true;
 }
 
 //+------------------------------------------------------------------+
@@ -144,23 +237,36 @@ void OnTick()
       return;
    }
 
-   if(EntriesToday() >= InpMaxEntriesPerDay)
+   if(EntriesToday() >= g_maxEntries)
    {
       DeleteOurPendings();
       g_ordersBar = bar;
       if(g_capLoggedDay != DayStart(TimeCurrent()))
       {
          g_capLoggedDay = DayStart(TimeCurrent());
-         Print("NQ50 entry cap reached (", InpMaxEntriesPerDay, "). No new entries until the next day.");
+         Print("NQ50 entry cap reached (", g_maxEntries, "). No new entries until the next day.");
       }
+      UpdateComment(bar);
+      return;
+   }
+
+   const double lotsNow = NormalizedLots();
+   if(lotsNow <= 0.0)
+   {
+      DeleteOurPendings();
+      LogOnce("Equity " + DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2)
+              + " is at or below the floor. No new entries.");
       UpdateComment(bar);
       return;
    }
 
    // Orders for this bar are already working, or this bar already took its entry.
    // A stop-out does not open a replacement until the next bar.
+   // Resting stops are resized when equity moves the lot size.
    if(g_ordersBar == bar)
    {
+      if(MathAbs(lotsNow - g_sentLots) > 1e-8 && ResizeWorkingStops())
+         g_sentLots = lotsNow;
       UpdateComment(bar);
       return;
    }
@@ -168,7 +274,10 @@ void OnTick()
    bool retry = true;
    RefreshBreakoutOrders(retry);
    if(!retry)
+   {
       g_ordersBar = bar;
+      g_sentLots = lotsNow;
+   }
 
    UpdateComment(bar);
 }
@@ -176,15 +285,15 @@ void OnTick()
 //+------------------------------------------------------------------+
 void ConfigureTrade()
 {
-   g_trade.SetExpertMagicNumber(InpMagic);
+   g_trade.SetExpertMagicNumber(g_magic);
    g_trade.SetAsyncMode(false);
    g_trade.LogLevel(LOG_LEVEL_ERRORS);
 
    const double tick = TickSize();
    const double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   int deviation = InpSlippageTicks;
+   int deviation = g_slippage;
    if(tick > 0.0 && point > 0.0)
-      deviation = (int)MathRound(InpSlippageTicks * tick / point);
+      deviation = (int)MathRound(g_slippage * tick / point);
    if(deviation < 1)
       deviation = 1;
    g_trade.SetDeviationInPoints(deviation);
@@ -203,7 +312,7 @@ datetime DayStart(const datetime t)
 {
    MqlDateTime dt;
    TimeToStruct(t, dt);
-   dt.hour = InpDayResetHour;
+   dt.hour = g_dayReset;
    dt.min = 0;
    dt.sec = 0;
    datetime start = StructToTime(dt);
@@ -301,103 +410,59 @@ double MinStopDistance()
 //+------------------------------------------------------------------+
 double NormalizedLots()
 {
-   double lots = InpLots;
-   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lots = EffectiveLotsRaw();
+   if(lots <= 0.0)
+      return 0.0;
+   const double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   const double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
    const double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-   if(minLot <= 0.0)
-      minLot = 0.01;
-   if(lots < minLot)
-      lots = minLot;
+   if(step > 0.0)
+      lots = MathFloor(lots / step + 1e-8) * step;
+   if(minLot > 0.0 && lots < minLot)
+      return 0.0;
    if(maxLot > 0.0 && lots > maxLot)
       lots = maxLot;
-   if(step > 0.0)
-   {
-      lots = MathFloor(lots / step + 1e-8) * step;
-      if(lots < minLot)
-         lots = minLot;
-   }
    return NormalizeDouble(lots, 8);
 }
 
 //+------------------------------------------------------------------+
-double MoneyStopDistance(const ENUM_ORDER_TYPE side)
+bool CandleStop(const ENUM_ORDER_TYPE side, const int prevShift, const double entry, double &sl)
 {
-   const double tick = TickSize();
-   const double lots = NormalizedLots();
-   if(tick <= 0.0 || lots <= 0.0 || InpStopLossMoney <= 0.0)
-      return 0.0;
-
-   double price = (side == ORDER_TYPE_BUY)
-                  ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
-                  : SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   if(price <= 0.0)
-      price = SymbolInfoDouble(_Symbol, SYMBOL_LAST);
-   if(price <= 0.0)
-      return 0.0;
-
-   const double close = (side == ORDER_TYPE_BUY) ? price - tick : price + tick;
-   double profit = 0.0;
-   if(OrderCalcProfit(side, _Symbol, lots, price, close, profit) && profit != 0.0)
-      return (InpStopLossMoney / MathAbs(profit)) * tick;
-
-   const double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-   if(tickValue <= 0.0)
-      return 0.0;
-   return (InpStopLossMoney / (tickValue * lots)) * tick;
-}
-
-//+------------------------------------------------------------------+
-void LogRiskOnce(const ENUM_ORDER_TYPE side)
-{
-   if(g_loggedRisk)
-      return;
-   const double dist = MoneyStopDistance(side);
-   if(dist <= 0.0)
-      return;
-   g_loggedRisk = true;
-   const double tick = TickSize();
-   const double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-   Print("NQ50 risk check. Tick ", DoubleToString(tick, DigitsSym()),
-         ", tick value ", DoubleToString(tickValue, 2),
-         " per lot. Volume ", DoubleToString(NormalizedLots(), 2),
-         ". A ", DoubleToString(InpStopLossMoney, 2),
-         " stop is ", DoubleToString(dist, DigitsSym()),
-         " price units (", DoubleToString(dist / tick, 1), " ticks). ",
-         "Account currency: ", AccountInfoString(ACCOUNT_CURRENCY), ".");
-}
-
-//+------------------------------------------------------------------+
-bool StopPriceFor(const ENUM_ORDER_TYPE side, const double entry, double &sl)
-{
-   const double dist = MoneyStopDistance(side);
-   if(dist <= 0.0)
+   if(prevShift < 1 || Bars(_Symbol, g_tf) <= prevShift)
       return false;
 
-   sl = (side == ORDER_TYPE_BUY) ? NormPrice(entry - dist) : NormPrice(entry + dist);
-   if(side == ORDER_TYPE_BUY && sl >= entry)
+   const bool isBuy = (side == ORDER_TYPE_BUY);
+   const double raw = isBuy ? iLow(_Symbol, g_tf, prevShift) : iHigh(_Symbol, g_tf, prevShift);
+   if(raw <= 0.0)
       return false;
-   if(side == ORDER_TYPE_SELL && sl <= entry)
+   sl = NormPrice(raw);
+   if(isBuy && sl >= entry)
+      return false;
+   if(!isBuy && sl <= entry)
       return false;
 
    const double minDist = MinStopDistance();
    if(minDist > 0.0 && MathAbs(entry - sl) + TickSize() * 0.5 < minDist)
    {
-      LogOnce("Stop of " + DoubleToString(InpStopLossMoney, 2)
-              + " is inside the broker minimum stop distance. No order sent.");
+      LogOnce("Previous-candle stop is inside the broker minimum stop distance. No order sent.");
       return false;
    }
-   LogRiskOnce(side);
    return true;
+}
+
+//+------------------------------------------------------------------+
+bool StopPriceFor(const ENUM_ORDER_TYPE side, const double entry, double &sl)
+{
+   return CandleStop(side, 1, entry, sl);
 }
 
 //+------------------------------------------------------------------+
 bool Channel(double &hh, double &ll)
 {
-   if(Bars(_Symbol, g_tf) < InpLookback + 1)
+   if(Bars(_Symbol, g_tf) < g_lookback + 1)
       return false;
-   const int hi = iHighest(_Symbol, g_tf, MODE_HIGH, InpLookback, 1);
-   const int lo = iLowest(_Symbol, g_tf, MODE_LOW, InpLookback, 1);
+   const int hi = iHighest(_Symbol, g_tf, MODE_HIGH, g_lookback, 1);
+   const int lo = iLowest(_Symbol, g_tf, MODE_LOW, g_lookback, 1);
    if(hi < 0 || lo < 0)
       return false;
    hh = iHigh(_Symbol, g_tf, hi);
@@ -421,7 +486,7 @@ int EntriesToday()
          continue;
       if(HistoryDealGetString(ticket, DEAL_SYMBOL) != _Symbol)
          continue;
-      if((ulong)HistoryDealGetInteger(ticket, DEAL_MAGIC) != InpMagic)
+      if((ulong)HistoryDealGetInteger(ticket, DEAL_MAGIC) != g_magic)
          continue;
       if(HistoryDealGetInteger(ticket, DEAL_ENTRY) != DEAL_ENTRY_IN)
          continue;
@@ -443,7 +508,7 @@ int OurPositions(ulong &tickets[])
          continue;
       if(PositionGetString(POSITION_SYMBOL) != _Symbol)
          continue;
-      if((ulong)PositionGetInteger(POSITION_MAGIC) != InpMagic)
+      if((ulong)PositionGetInteger(POSITION_MAGIC) != g_magic)
          continue;
       const int n = ArraySize(tickets);
       ArrayResize(tickets, n + 1);
@@ -463,7 +528,7 @@ int OurOrders(ulong &tickets[], const int typeFilter)
          continue;
       if(OrderGetString(ORDER_SYMBOL) != _Symbol)
          continue;
-      if((ulong)OrderGetInteger(ORDER_MAGIC) != InpMagic)
+      if((ulong)OrderGetInteger(ORDER_MAGIC) != g_magic)
          continue;
       if(typeFilter >= 0 && (int)OrderGetInteger(ORDER_TYPE) != typeFilter)
          continue;
@@ -527,10 +592,25 @@ void CloseIfHeldFromPriorBar(const datetime barOpen)
    {
       if(!PositionSelectByTicket(tickets[i]))
          continue;
-      if((datetime)PositionGetInteger(POSITION_TIME) >= barOpen)
+      const datetime opened = (datetime)PositionGetInteger(POSITION_TIME);
+      if(opened >= barOpen)
          continue;
+
+      if(InpExitMode == NQ_EXIT_PROFIT)
+      {
+         // The candle after the entry bar must have closed. A later close can still take profit.
+         const int shift = iBarShift(_Symbol, g_tf, opened, false);
+         if(shift < 2)
+            continue;
+         const double pnl = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+         if(pnl <= 0.0)
+            continue;
+      }
+
       if(g_trade.PositionClose(tickets[i]))
-         Print("NQ50 exit at ", EnumToString(g_tf), " open. Ticket ", (string)tickets[i],
+         Print("NQ50 exit at ", EnumToString(g_tf), " ",
+               (InpExitMode == NQ_EXIT_RAW ? "open" : "close, in profit"),
+               ". Ticket ", (string)tickets[i],
                " price ", DoubleToString(g_trade.ResultPrice(), DigitsSym()));
       else
          LogOnce("Exit failed ticket " + (string)tickets[i] + ": " + g_trade.ResultRetcodeDescription());
@@ -551,11 +631,15 @@ void EnsurePositionStop()
 
       const bool isBuy = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
       const ENUM_ORDER_TYPE side = isBuy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+      const datetime opened = (datetime)PositionGetInteger(POSITION_TIME);
+      int shift = iBarShift(_Symbol, g_tf, opened, false);
+      if(shift < 0)
+         shift = 0;
       double sl = 0.0;
-      if(!StopPriceFor(side, PositionGetDouble(POSITION_PRICE_OPEN), sl))
+      if(!CandleStop(side, shift + 1, PositionGetDouble(POSITION_PRICE_OPEN), sl))
          continue;
       if(!g_trade.PositionModify(tickets[i], sl, 0.0))
-         LogOnce("Could not attach the cash stop: " + g_trade.ResultRetcodeDescription());
+         LogOnce("Could not attach the previous-candle stop: " + g_trade.ResultRetcodeDescription());
    }
 }
 
@@ -702,7 +786,7 @@ void RefreshBreakoutOrders(bool &retry)
    if(!Channel(hh, ll))
    {
       retry = true;
-      LogOnce("Waiting for " + IntegerToString(InpLookback) + " closed " + EnumToString(g_tf) + " bars.");
+      LogOnce("Waiting for " + IntegerToString(g_lookback) + " closed " + EnumToString(g_tf) + " bars.");
       return;
    }
 
@@ -784,8 +868,8 @@ void UpdateComment(const datetime bar)
    const bool haveChannel = Channel(hh, ll);
    if(haveChannel)
    {
-      DrawLevel("NQ50_High", hh, clrDodgerBlue, "50-bar high");
-      DrawLevel("NQ50_Low", ll, clrOrangeRed, "50-bar low");
+      DrawLevel("NQ50_High", hh, clrDodgerBlue, IntegerToString(g_lookback) + "-bar high");
+      DrawLevel("NQ50_Low", ll, clrOrangeRed, IntegerToString(g_lookback) + "-bar low");
    }
    else
    {
@@ -795,18 +879,25 @@ void UpdateComment(const datetime bar)
 
    string action = "Waiting for the channel";
    if(HasOurPosition())
-      action = "Exit at the next " + EnumToString(g_tf) + " open, unless the stop is hit first";
-   else if(EntriesToday() >= InpMaxEntriesPerDay)
+      action = (InpExitMode == NQ_EXIT_RAW)
+               ? "Exit when the next bar opens, unless the stop is hit first"
+               : "Exit on a later bar open only while in profit, unless the stop is hit first";
+   else if(EntriesToday() >= g_maxEntries)
       action = "Daily entry cap reached";
    else if(haveChannel && g_ordersBar == bar)
       action = "Buy and sell stops are working";
    else if(haveChannel)
       action = "Placing stops";
 
-   Comment("NQ 50-bar breakout  ", EnumToString(g_tf), "  24h\n",
+   Comment(EnumToString(g_tf), "  equity ", DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 0),
+           "  ratio ", DoubleToString(EquityRatio(), 2), "\n",
+           "Lots ", DoubleToString(NormalizedLots(), 2),
+           " (input ", DoubleToString(InpLots, 2), ")",
+           "   SL previous candle",
+           "   exit ", (InpExitMode == NQ_EXIT_RAW ? "Raw" : "Profit only"), "\n",
            "Buy stop   ", (haveChannel ? DoubleToString(hh, DigitsSym()) : "-"), "\n",
            "Sell stop  ", (haveChannel ? DoubleToString(ll, DigitsSym()) : "-"), "\n",
-           "Entries today  ", IntegerToString(EntriesToday()), " / ", IntegerToString(InpMaxEntriesPerDay), "\n",
+           "Entries today  ", IntegerToString(EntriesToday()), " / ", IntegerToString(g_maxEntries), "\n",
            "Position  ", PositionText(), "\n",
            action);
 }
