@@ -21,7 +21,7 @@
 //| 1-minute OHLC or real ticks so stops can fill inside the bar.   |
 //+------------------------------------------------------------------+
 #property copyright "Onlybreakout"
-#property version   "1.06"
+#property version   "1.07"
 #property description "50-bar breakout. Buy stop at the channel high, sell stop at the channel low."
 #property description "Exit at the next bar open. Stop is 1000 account currency. Max 2 entries per day."
 
@@ -59,6 +59,8 @@ datetime g_ordersBar       = 0;
 datetime g_seenBar         = 0;
 datetime g_capLoggedDay    = 0;
 double   g_sentLots        = -1.0;
+datetime g_sizeDay         = 0;
+double   g_frozenLots      = -1.0;
 string   g_lastLog         = "";
 
 // Equity sizing is applied to the stop and the lot input. It is not an input.
@@ -124,6 +126,8 @@ int OnInit()
    g_seenBar = 0;
    g_capLoggedDay = 0;
    g_sentLots = -1.0;
+   g_sizeDay = 0;
+   g_frozenLots = -1.0;
    g_lastLog = "";
    ConfigureTrade();
 
@@ -262,7 +266,7 @@ void OnTick()
 
    // Orders for this bar are already working, or this bar already took its entry.
    // A stop-out does not open a replacement until the next bar.
-   // Resting stops are resized when equity moves the lot size.
+   // Lot size changes only at the day reset, so this replaces resting stops once.
    if(g_ordersBar == bar)
    {
       if(MathAbs(lotsNow - g_sentLots) > 1e-8 && ResizeWorkingStops())
@@ -408,7 +412,7 @@ double MinStopDistance()
 }
 
 //+------------------------------------------------------------------+
-double NormalizedLots()
+double LotsFromEquity()
 {
    double lots = EffectiveLotsRaw();
    if(lots <= 0.0)
@@ -423,6 +427,26 @@ double NormalizedLots()
    if(maxLot > 0.0 && lots > maxLot)
       lots = maxLot;
    return NormalizeDouble(lots, 8);
+}
+
+//+------------------------------------------------------------------+
+void LockDailyLots()
+{
+   const datetime day = DayStart(TimeCurrent());
+   if(g_sizeDay == day && g_frozenLots >= 0.0)
+      return;
+   g_sizeDay = day;
+   g_frozenLots = LotsFromEquity();
+   Print("NQ50 lots locked at ", DoubleToString(g_frozenLots, 2),
+         " for the day starting ", TimeToString(day, TIME_DATE|TIME_MINUTES),
+         ". Equity ", DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2), ".");
+}
+
+//+------------------------------------------------------------------+
+double NormalizedLots()
+{
+   LockDailyLots();
+   return (g_frozenLots < 0.0 ? 0.0 : g_frozenLots);
 }
 
 //+------------------------------------------------------------------+
