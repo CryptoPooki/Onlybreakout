@@ -10,6 +10,7 @@
 //| Exit:      after the entry bar has closed, only while in profit |
 //| Stop loss: 1000 account currency per trade                      |
 //| Cap:       2 entries per day                                     |
+//| Brake:     market-close every position after a 9000 daily drop  |
 //|                                                                  |
 //| The channel uses the last 50 closed bars of the signal timeframe.|
 //| The forming bar is not included. A gap through a level fills    |
@@ -22,7 +23,7 @@
 //| 1-minute OHLC or real ticks so stops can fill inside the bar.   |
 //+------------------------------------------------------------------+
 #property copyright "Onlybreakout"
-#property version   "1.10"
+#property version   "1.12"
 #property description "50-bar breakout. Buy stop at the channel high, sell stop at the channel low."
 #property description "Direction is long only, short only, or both. Exit only while in profit."
 
@@ -63,13 +64,17 @@ datetime g_capLoggedDay    = 0;
 double   g_sentLots        = -1.0;
 datetime g_sizeDay         = 0;
 double   g_frozenLots      = -1.0;
+datetime g_ddDay           = 0;
+double   g_dayEquity       = 0.0;
+datetime g_brakeLoggedDay  = 0;
 string   g_lastLog         = "";
 
 // Equity sizing is applied to the stop and the lot input. It is not an input.
 const double EQUITY_BASE = 180000.0;
-const double EQUITY_CAP  = 190000.0;
+const double EQUITY_CAP  = 192000.0;
 const double EQUITY_UNIT = 6000.0;
 const double SIZE_FACTOR = 0.35;
+const double DAILY_DRAWDOWN_LIMIT = 9000.0;
 
 //+------------------------------------------------------------------+
 double EquityRatio()
@@ -156,6 +161,9 @@ int OnInit()
    g_sentLots = -1.0;
    g_sizeDay = 0;
    g_frozenLots = -1.0;
+   g_ddDay = 0;
+   g_dayEquity = 0.0;
+   g_brakeLoggedDay = 0;
    g_lastLog = "";
    ConfigureTrade();
 
@@ -169,7 +177,8 @@ int OnInit()
          ", ratio ", DoubleToString(EquityRatio(), 3),
          ", factor ", DoubleToString(SizeFactor(), 3),
          ", lots ", DoubleToString(EffectiveLotsRaw(), 2),
-         " from input ", DoubleToString(InpLots, 2), ".");
+         " from input ", DoubleToString(InpLots, 2),
+         ". Emergency brake at ", DoubleToString(DAILY_DRAWDOWN_LIMIT, 0), " daily drawdown.");
    return INIT_SUCCEEDED;
 }
 
@@ -251,6 +260,92 @@ bool ResizeWorkingStops()
 }
 
 //+------------------------------------------------------------------+
+string DayEquityKey(const datetime day)
+{
+   return "NQ50DD_" + IntegerToString((int)AccountInfoInteger(ACCOUNT_LOGIN)) + "_" + IntegerToString((int)day);
+}
+
+//+------------------------------------------------------------------+
+void LockDayEquity()
+{
+   const datetime day = DayStart(TimeCurrent());
+   if(g_ddDay == day)
+      return;
+   if(g_ddDay != 0 && !MQLInfoInteger(MQL_TESTER))
+      GlobalVariableDel(DayEquityKey(g_ddDay));
+   g_ddDay = day;
+
+   if(MQLInfoInteger(MQL_TESTER))
+   {
+      g_dayEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+      return;
+   }
+
+   const string key = DayEquityKey(day);
+   if(GlobalVariableCheck(key))
+   {
+      g_dayEquity = GlobalVariableGet(key);
+      return;
+   }
+   g_dayEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   GlobalVariableSet(key, g_dayEquity);
+}
+
+//+------------------------------------------------------------------+
+double DailyDrawdown()
+{
+   LockDayEquity();
+   const double drop = g_dayEquity - AccountInfoDouble(ACCOUNT_EQUITY);
+   if(drop < 0.0)
+      return 0.0;
+   return drop;
+}
+
+//+------------------------------------------------------------------+
+void PrepareSymbolTrade(const string symbol)
+{
+   const long mode = SymbolInfoInteger(symbol, SYMBOL_FILLING_MODE);
+   if((mode & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK)
+      g_trade.SetTypeFilling(ORDER_FILLING_FOK);
+   else if((mode & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC)
+      g_trade.SetTypeFilling(ORDER_FILLING_IOC);
+   else
+      g_trade.SetTypeFilling(ORDER_FILLING_RETURN);
+   g_trade.SetDeviationInPoints(100000);
+}
+
+//+------------------------------------------------------------------+
+bool EmergencyBrake()
+{
+   const double drop = DailyDrawdown();
+   if(drop < DAILY_DRAWDOWN_LIMIT)
+      return false;
+
+   const datetime day = DayStart(TimeCurrent());
+   if(g_brakeLoggedDay != day)
+   {
+      g_brakeLoggedDay = day;
+      Print("NQ50 emergency brake. Daily drawdown ", DoubleToString(drop, 2),
+            " has reached ", DoubleToString(DAILY_DRAWDOWN_LIMIT, 0),
+            ". Closing every position until the next day.");
+   }
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      const ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket))
+         continue;
+      const string symbol = PositionGetString(POSITION_SYMBOL);
+      SymbolSelect(symbol, true);
+      PrepareSymbolTrade(symbol);
+      if(!g_trade.PositionClose(ticket))
+         Print("Emergency close failed ticket ", (string)ticket, ": ", g_trade.ResultRetcodeDescription());
+   }
+   DeleteOurPendings();
+   return true;
+}
+
+//+------------------------------------------------------------------+
 void OnTick()
 {
    const datetime bar = iTime(_Symbol, g_tf, 0);
@@ -264,6 +359,11 @@ void OnTick()
    }
 
    ConfigureTrade();
+   if(EmergencyBrake())
+   {
+      UpdateComment(bar);
+      return;
+   }
    CloseIfHeldFromPriorBar(bar);
 
    if(HasOurPosition())
@@ -959,7 +1059,9 @@ void UpdateComment(const datetime bar)
    }
 
    string action = "Waiting for the channel";
-   if(HasOurPosition())
+   if(DailyDrawdown() >= DAILY_DRAWDOWN_LIMIT)
+      action = "Emergency brake: daily drawdown limit hit";
+   else if(HasOurPosition())
       action = "Exit on a later bar open only while in profit, unless the stop is hit first";
    else if(EntriesToday() >= g_maxEntries)
       action = "Daily entry cap reached";
@@ -979,6 +1081,7 @@ void UpdateComment(const datetime bar)
            "Buy stop   ", (haveChannel ? DoubleToString(hh, DigitsSym()) : "-"), "\n",
            "Sell stop  ", (haveChannel ? DoubleToString(ll, DigitsSym()) : "-"), "\n",
            "Entries today  ", IntegerToString(EntriesToday()), " / ", IntegerToString(g_maxEntries), "\n",
+           "Drawdown  ", DoubleToString(DailyDrawdown(), 0), " / ", DoubleToString(DAILY_DRAWDOWN_LIMIT, 0), "\n",
            "Position  ", PositionText(), "\n",
            action);
 }
