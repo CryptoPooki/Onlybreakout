@@ -7,8 +7,10 @@
 //| Long:      buy stop at the highest high of the last 50 bars      |
 //| Short:     sell stop at the lowest low of the last 50 bars       |
 //| Direction: long only, short only, or both                       |
-//| Exit:      after the entry bar has closed, only while in profit |
-//| Stop:      previous candle, then a trailing stop as % of price   |
+//| Exit:      after the entry bar has closed, and only if the last |
+//|            closed M1 bar finished in profit. A live tick is not |
+//|            a profit signal.                                      |
+//| Stop:      previous candle, or none. Trail is a percent of price |
 //| Cap:       2 entries per day                                     |
 //| Brake:     market-close every position after a 9000 daily drop  |
 //| Risk:      cap each order so the stop risks at most an input % |
@@ -24,9 +26,9 @@
 //| 1-minute OHLC or real ticks so stops can fill inside the bar.   |
 //+------------------------------------------------------------------+
 #property copyright "Onlybreakout"
-#property version   "1.19"
+#property version   "1.29"
 #property description "50-bar breakout. Buy stop at the channel high, sell stop at the channel low."
-#property description "Direction is long only, short only, or both. Exit only while in profit."
+#property description "Direction is long only, short only, or both. Profit exit waits for a closed M1 bar."
 
 #include <Trade/Trade.mqh>
 
@@ -48,6 +50,10 @@ input group "=== Trade ==="
 input double InpLots               = 1.0;     // Volume, lots
 input double InpMaxRiskPercent     = 5.0;     // Max loss per order, percent of equity
 input double InpTrailPercent       = 0.0;     // Trailing stop, percent of price (0 = off)
+input bool   InpNoStop             = false;   // No stop loss
+input int    InpMaxHoldHours       = 0;       // Close after this many hours (0 = off)
+input bool   InpOverclock          = false;   // Overclock, use the input volume above the floor
+input double InpEquityFloor        = 180000.0; // Equity floor for sizing
 input ulong  InpMagic              = 50302026;
 input int    InpSlippageTicks      = 10;      // Max slippage, ticks
 input bool   InpRemoveStopsOnRemove = true;   // Delete resting stops when the EA is removed
@@ -74,8 +80,7 @@ double   g_trailBest      = 0.0;
 datetime g_trailMinute    = 0;
 string   g_lastLog         = "";
 
-// Equity sizing is applied to the lot input. It is not an input.
-const double EQUITY_BASE = 180000.0;
+// Equity sizing is applied to the lot input.
 const double EQUITY_CAP  = 210000.0;
 const double EQUITY_UNIT = 6000.0;
 const double SIZE_FACTOR = 0.35;
@@ -84,19 +89,19 @@ const double DAILY_DRAWDOWN_LIMIT = 9000.0;
 //+------------------------------------------------------------------+
 double EquityRatio()
 {
-   return (AccountInfoDouble(ACCOUNT_EQUITY) - EQUITY_BASE) / EQUITY_UNIT;
+   return (AccountInfoDouble(ACCOUNT_EQUITY) - InpEquityFloor) / EQUITY_UNIT;
 }
 
 //+------------------------------------------------------------------+
 double SizeFactor()
 {
-   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-   if(equity > EQUITY_CAP)
-      equity = EQUITY_CAP;
-   const double ratio = (equity - EQUITY_BASE) / EQUITY_UNIT;
-   if(ratio <= 0.0)
+   const double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   if(equity <= InpEquityFloor)
       return 0.0;
-   return ratio * SIZE_FACTOR;
+   if(InpOverclock)
+      return 1.0;
+   const double capped = (equity > EQUITY_CAP ? EQUITY_CAP : equity);
+   return (capped - InpEquityFloor) / EQUITY_UNIT * SIZE_FACTOR;
 }
 
 //+------------------------------------------------------------------+
@@ -130,11 +135,13 @@ string DirectionText()
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   if(InpLookback < 2 || InpMaxEntriesPerDay < 1 || InpLots <= 0.0)
+   if(InpLookback < 2 || InpMaxEntriesPerDay < 1 || InpLots <= 0.0 || InpEquityFloor <= 0.0)
       return INIT_PARAMETERS_INCORRECT;
    if(InpMaxRiskPercent <= 0.0 || InpMaxRiskPercent > 100.0)
       return INIT_PARAMETERS_INCORRECT;
    if(InpTrailPercent < 0.0 || InpTrailPercent >= 100.0)
+      return INIT_PARAMETERS_INCORRECT;
+   if(InpMaxHoldHours < 0)
       return INIT_PARAMETERS_INCORRECT;
    if(InpDayResetHour < 0 || InpDayResetHour > 23)
       return INIT_PARAMETERS_INCORRECT;
@@ -184,8 +191,10 @@ int OnInit()
          " bars, max ", g_maxEntries,
          " entries/day, day resets at ", g_dayReset, ":00.",
          " Direction ", DirectionText(),
-         ". Stop is the previous candle. Trail ", DoubleToString(InpTrailPercent, 2),
-         "% of price. Exit only in profit",
+         InpNoStop ? ". No stop loss. Exit only after a closed M1 bar in profit"
+                   : ". Stop is the previous candle. Trail " + DoubleToString(InpTrailPercent, 2)
+                     + "% of price. Exit only after a closed M1 bar in profit",
+         InpMaxHoldHours > 0 ? ". Close after " + IntegerToString(InpMaxHoldHours) + " hours." : ". No time exit.",
          ". Equity ", DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2),
          ", ratio ", DoubleToString(EquityRatio(), 3),
          ", factor ", DoubleToString(SizeFactor(), 3),
@@ -247,8 +256,10 @@ bool ResizeWorkingStops()
       const ENUM_ORDER_TYPE side = (type == ORDER_TYPE_BUY_STOP || type == ORDER_TYPE_BUY_LIMIT || type == ORDER_TYPE_BUY)
                                    ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
       double sl = 0.0;
-      if(!StopPriceFor(side, price, sl))
+      const bool haveLevel = InpNoStop ? RiskLevel(side, price, sl) : StopPriceFor(side, price, sl);
+      if(!haveLevel && !InpNoStop)
          return false;
+      const double brokerSl = InpNoStop ? 0.0 : sl;
       if((side == ORDER_TYPE_BUY && !AllowBuy()) || (side == ORDER_TYPE_SELL && !AllowSell()))
       {
          if(!g_trade.OrderDelete(tickets[i]))
@@ -257,7 +268,7 @@ bool ResizeWorkingStops()
       }
       const double vol = OrderGetDouble(ORDER_VOLUME_CURRENT);
       const double curSl = OrderGetDouble(ORDER_SL);
-      const double lots = CapLotsForRisk(base, side, price, sl);
+      const double lots = haveLevel ? CapLotsForRisk(base, side, price, sl) : base;
       if(lots <= 0.0)
       {
          ReportRiskSize(side == ORDER_TYPE_BUY ? "buy" : "sell", base, lots, side, price, sl);
@@ -265,13 +276,13 @@ bool ResizeWorkingStops()
             return false;
          continue;
       }
-      if(MathAbs(vol - lots) <= 1e-8 && MathAbs(curSl - sl) < TickSize() * 0.5)
+      if(MathAbs(vol - lots) <= 1e-8 && MathAbs(curSl - brokerSl) < TickSize() * 0.5)
          continue;
       if(!g_trade.OrderDelete(tickets[i]))
          return false;
       const bool ok = (side == ORDER_TYPE_BUY)
-                      ? g_trade.BuyStop(lots, price, _Symbol, sl, 0.0, ORDER_TIME_GTC, 0, "NQ50 buy stop")
-                      : g_trade.SellStop(lots, price, _Symbol, sl, 0.0, ORDER_TIME_GTC, 0, "NQ50 sell stop");
+                      ? g_trade.BuyStop(lots, price, _Symbol, brokerSl, 0.0, ORDER_TIME_GTC, 0, "NQ50 buy stop")
+                      : g_trade.SellStop(lots, price, _Symbol, brokerSl, 0.0, ORDER_TIME_GTC, 0, "NQ50 sell stop");
       if(!ok)
       {
          LogOnce("NQ50 size update failed: " + g_trade.ResultRetcodeDescription());
@@ -388,6 +399,7 @@ void OnTick()
       return;
    }
    CloseIfHeldFromPriorBar(bar);
+   CloseIfExpired();
 
    if(HasOurPosition())
    {
@@ -663,7 +675,7 @@ void ReportRiskSize(const string side, const double base, const double lots,
 }
 
 //+------------------------------------------------------------------+
-bool CandleStop(const ENUM_ORDER_TYPE side, const int prevShift, const double entry, double &sl)
+bool CandleStop(const ENUM_ORDER_TYPE side, const int prevShift, const double entry, double &sl, const bool checkDistance)
 {
    if(prevShift < 1 || Bars(_Symbol, g_tf) <= prevShift)
       return false;
@@ -678,6 +690,9 @@ bool CandleStop(const ENUM_ORDER_TYPE side, const int prevShift, const double en
    if(!isBuy && sl <= entry)
       return false;
 
+   if(!checkDistance)
+      return true;
+
    const double minDist = MinStopDistance();
    if(minDist > 0.0 && MathAbs(entry - sl) + TickSize() * 0.5 < minDist)
    {
@@ -690,7 +705,14 @@ bool CandleStop(const ENUM_ORDER_TYPE side, const int prevShift, const double en
 //+------------------------------------------------------------------+
 bool StopPriceFor(const ENUM_ORDER_TYPE side, const double entry, double &sl)
 {
-   return CandleStop(side, 1, entry, sl);
+   return CandleStop(side, 1, entry, sl, true);
+}
+
+//+------------------------------------------------------------------+
+// The risk cap still uses the previous candle when no broker stop is sent.
+bool RiskLevel(const ENUM_ORDER_TYPE side, const double entry, double &sl)
+{
+   return CandleStop(side, 1, entry, sl, false);
 }
 
 //+------------------------------------------------------------------+
@@ -830,6 +852,27 @@ ulong FindPending(const ENUM_ORDER_TYPE type)
 }
 
 //+------------------------------------------------------------------+
+bool ClosedM1BarInProfit(const bool isBuy, const double openPrice, const datetime opened, datetime &closedBar, double &closedPrice)
+{
+   closedBar = iTime(_Symbol, PERIOD_M1, 1);
+   closedPrice = iClose(_Symbol, PERIOD_M1, 1);
+   if(closedBar <= 0 || closedPrice <= 0.0)
+   {
+      LogOnce("Profit exit is waiting for a closed M1 bar.");
+      return false;
+   }
+
+   // Shift 1 has finished. A bar that ended at or before the fill cannot confirm the trade.
+   if(closedBar + PeriodSeconds(PERIOD_M1) <= opened)
+      return false;
+
+   const double spread = SymbolInfoDouble(_Symbol, SYMBOL_ASK) - SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   if(isBuy)
+      return (closedPrice > openPrice);
+   return (closedPrice + (spread > 0.0 ? spread : 0.0) < openPrice);
+}
+
+//+------------------------------------------------------------------+
 void CloseIfHeldFromPriorBar(const datetime barOpen)
 {
    ulong tickets[];
@@ -842,20 +885,55 @@ void CloseIfHeldFromPriorBar(const datetime barOpen)
       if(opened >= barOpen)
          continue;
 
-      // The candle after the entry bar must have closed. A later close can still take profit.
+      // The signal candle after the entry bar must have closed. Profit is then
+      // read from the last closed M1 bar, never from the forming bar's tick.
       const int shift = iBarShift(_Symbol, g_tf, opened, false);
       if(shift < 2)
          continue;
-      const double pnl = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
-      if(pnl <= 0.0)
+
+      const bool isBuy = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
+      const double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      datetime closedBar = 0;
+      double closedPrice = 0.0;
+      if(!ClosedM1BarInProfit(isBuy, openPrice, opened, closedBar, closedPrice))
          continue;
 
       if(g_trade.PositionClose(tickets[i]))
-         Print("NQ50 exit at ", EnumToString(g_tf), " close, in profit. Ticket ",
-               (string)tickets[i],
+         Print("NQ50 exit on closed M1 bar ", TimeToString(closedBar, TIME_DATE | TIME_MINUTES),
+               " close ", DoubleToString(closedPrice, DigitsSym()),
+               ", in profit. Ticket ", (string)tickets[i],
                " price ", DoubleToString(g_trade.ResultPrice(), DigitsSym()));
       else
          LogOnce("Exit failed ticket " + (string)tickets[i] + ": " + g_trade.ResultRetcodeDescription());
+   }
+}
+
+//+------------------------------------------------------------------+
+void CloseIfExpired()
+{
+   if(InpMaxHoldHours <= 0)
+      return;
+
+   const datetime now = TimeCurrent();
+   const int limit = InpMaxHoldHours * 3600;
+   ulong tickets[];
+   OurPositions(tickets);
+   for(int i = 0; i < ArraySize(tickets); i++)
+   {
+      if(!PositionSelectByTicket(tickets[i]))
+         continue;
+      const datetime opened = (datetime)PositionGetInteger(POSITION_TIME);
+      if(opened <= 0 || (now - opened) < limit)
+         continue;
+
+      const double pnl = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+      if(g_trade.PositionClose(tickets[i]))
+         Print("NQ50 time exit after ", IntegerToString(InpMaxHoldHours),
+               " hours. Ticket ", (string)tickets[i],
+               " profit ", DoubleToString(pnl, 2),
+               " price ", DoubleToString(g_trade.ResultPrice(), DigitsSym()));
+      else
+         LogOnce("Time exit failed ticket " + (string)tickets[i] + ": " + g_trade.ResultRetcodeDescription());
    }
 }
 
@@ -868,6 +946,14 @@ void EnsurePositionStop()
    {
       if(!PositionSelectByTicket(tickets[i]))
          continue;
+      if(InpNoStop)
+      {
+         if(PositionGetDouble(POSITION_SL) <= 0.0)
+            continue;
+         if(!g_trade.PositionModify(tickets[i], 0.0, 0.0))
+            LogOnce("Could not remove the stop: " + g_trade.ResultRetcodeDescription());
+         continue;
+      }
       if(PositionGetDouble(POSITION_SL) > 0.0)
          continue;
 
@@ -878,7 +964,7 @@ void EnsurePositionStop()
       if(shift < 0)
          shift = 0;
       double sl = 0.0;
-      if(!CandleStop(side, shift + 1, PositionGetDouble(POSITION_PRICE_OPEN), sl))
+      if(!CandleStop(side, shift + 1, PositionGetDouble(POSITION_PRICE_OPEN), sl, true))
          continue;
       if(!g_trade.PositionModify(tickets[i], sl, 0.0))
          LogOnce("Could not attach the previous-candle stop: " + g_trade.ResultRetcodeDescription());
@@ -888,7 +974,7 @@ void EnsurePositionStop()
 //+------------------------------------------------------------------+
 void TrailPositions()
 {
-   if(InpTrailPercent <= 0.0)
+   if(InpNoStop || InpTrailPercent <= 0.0)
       return;
 
    const double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
@@ -956,6 +1042,7 @@ void TrailPositions()
    }
 }
 
+
 //+------------------------------------------------------------------+
 bool IsTransient(const uint ret)
 {
@@ -991,26 +1078,28 @@ bool SendMarket(const ENUM_ORDER_TYPE side, bool &retry)
    const double price = isBuy ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
                               : SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double sl = 0.0;
-   if(price <= 0.0 || !StopPriceFor(side, price, sl))
+   const bool haveLevel = InpNoStop ? RiskLevel(side, price, sl) : StopPriceFor(side, price, sl);
+   if(price <= 0.0 || (!haveLevel && !InpNoStop))
    {
       retry = (price <= 0.0);
       return false;
    }
 
    const double base = NormalizedLots();
-   const double lots = CapLotsForRisk(base, side, price, sl);
+   const double lots = haveLevel ? CapLotsForRisk(base, side, price, sl) : base;
+   const double brokerSl = InpNoStop ? 0.0 : sl;
    ReportRiskSize(isBuy ? "buy" : "sell", base, lots, side, price, sl);
    if(lots <= 0.0)
       return false;
 
-   const bool ok = isBuy ? g_trade.Buy(lots, _Symbol, 0.0, sl, 0.0, "NQ50 market")
-                         : g_trade.Sell(lots, _Symbol, 0.0, sl, 0.0, "NQ50 market");
+   const bool ok = isBuy ? g_trade.Buy(lots, _Symbol, 0.0, brokerSl, 0.0, "NQ50 market")
+                         : g_trade.Sell(lots, _Symbol, 0.0, brokerSl, 0.0, "NQ50 market");
    if(ok)
    {
       Print("NQ50 market ", (isBuy ? "buy" : "sell"),
             " ", DoubleToString(lots, 2), " at ",
             DoubleToString(g_trade.ResultPrice() > 0.0 ? g_trade.ResultPrice() : price, DigitsSym()),
-            " SL ", DoubleToString(sl, DigitsSym()),
+            brokerSl > 0.0 ? " SL " + DoubleToString(brokerSl, DigitsSym()) : " no SL",
             ". Level was already through at the bar open.");
       return true;
    }
@@ -1040,11 +1129,13 @@ bool EnsureStop(const ENUM_ORDER_TYPE type, const double level, bool &retry)
 
    const ENUM_ORDER_TYPE side = isBuy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
    double sl = 0.0;
-   if(!StopPriceFor(side, price, sl))
+   const bool haveLevel = InpNoStop ? RiskLevel(side, price, sl) : StopPriceFor(side, price, sl);
+   if(!haveLevel && !InpNoStop)
       return true;
 
    const double base = NormalizedLots();
-   const double lots = CapLotsForRisk(base, side, price, sl);
+   const double lots = haveLevel ? CapLotsForRisk(base, side, price, sl) : base;
+   const double brokerSl = InpNoStop ? 0.0 : sl;
    ulong ticket = FindPending(type);
    if(lots <= 0.0)
    {
@@ -1065,20 +1156,20 @@ bool EnsureStop(const ENUM_ORDER_TYPE type, const double level, bool &retry)
 
    if(ticket == 0)
    {
-      const bool ok = isBuy ? g_trade.BuyStop(lots, price, _Symbol, sl, 0.0, ORDER_TIME_GTC, 0, "NQ50 buy stop")
-                            : g_trade.SellStop(lots, price, _Symbol, sl, 0.0, ORDER_TIME_GTC, 0, "NQ50 sell stop");
+      const bool ok = isBuy ? g_trade.BuyStop(lots, price, _Symbol, brokerSl, 0.0, ORDER_TIME_GTC, 0, "NQ50 buy stop")
+                            : g_trade.SellStop(lots, price, _Symbol, brokerSl, 0.0, ORDER_TIME_GTC, 0, "NQ50 sell stop");
       if(ok)
       {
          Print("NQ50 ", (isBuy ? "buy" : "sell"), " stop ", DoubleToString(lots, 2),
                " at ", DoubleToString(price, DigitsSym()),
-               " SL ", DoubleToString(sl, DigitsSym()));
+               brokerSl > 0.0 ? " SL " + DoubleToString(brokerSl, DigitsSym()) : " no SL");
          ReportRiskSize(isBuy ? "buy" : "sell", base, lots, side, price, sl);
          return true;
       }
       retry = IsTransient(g_trade.ResultRetcode());
       LogOnce("NQ50 stop failed: " + g_trade.ResultRetcodeDescription()
               + " price " + DoubleToString(price, DigitsSym())
-              + " SL " + DoubleToString(sl, DigitsSym()));
+              + (brokerSl > 0.0 ? " SL " + DoubleToString(brokerSl, DigitsSym()) : " no SL"));
       return false;
    }
 
@@ -1089,10 +1180,10 @@ bool EnsureStop(const ENUM_ORDER_TYPE type, const double level, bool &retry)
    }
    const double curPrice = OrderGetDouble(ORDER_PRICE_OPEN);
    const double curSl = OrderGetDouble(ORDER_SL);
-   if(MathAbs(curPrice - price) < TickSize() * 0.5 && MathAbs(curSl - sl) < TickSize() * 0.5)
+   if(MathAbs(curPrice - price) < TickSize() * 0.5 && MathAbs(curSl - brokerSl) < TickSize() * 0.5)
       return true;
 
-   if(g_trade.OrderModify(ticket, price, sl, 0.0, ORDER_TIME_GTC, 0))
+   if(g_trade.OrderModify(ticket, price, brokerSl, 0.0, ORDER_TIME_GTC, 0))
       return true;
 
    retry = IsTransient(g_trade.ResultRetcode());
@@ -1227,7 +1318,12 @@ void UpdateComment(const datetime bar)
    if(DailyDrawdown() >= DAILY_DRAWDOWN_LIMIT)
       action = "Emergency brake: daily drawdown limit hit";
    else if(HasOurPosition())
-      action = "Exit on a later bar open only while in profit, unless the stop is hit first";
+   {
+      action = InpNoStop ? "Exit only after a closed M1 bar in profit"
+                         : "Exit only after a closed M1 bar in profit, unless the stop is hit first";
+      if(InpMaxHoldHours > 0)
+         action += ". Close after " + IntegerToString(InpMaxHoldHours) + " hours";
+   }
    else if(EntriesToday() >= g_maxEntries)
       action = "Daily entry cap reached";
    else if(haveChannel && g_ordersBar == bar)
@@ -1241,13 +1337,20 @@ void UpdateComment(const datetime bar)
    if(haveChannel)
    {
       const double base = NormalizedLots();
-      double sl = 0.0;
+      double buySl = 0.0;
+      double sellSl = 0.0;
       const double buyPx = NormPrice(hh);
       const double sellPx = NormPrice(ll);
-      if(StopPriceFor(ORDER_TYPE_BUY, buyPx, sl))
-         buyLots = CapLotsForRisk(base, ORDER_TYPE_BUY, buyPx, sl);
-      if(StopPriceFor(ORDER_TYPE_SELL, sellPx, sl))
-         sellLots = CapLotsForRisk(base, ORDER_TYPE_SELL, sellPx, sl);
+      const bool buyLevel = InpNoStop ? RiskLevel(ORDER_TYPE_BUY, buyPx, buySl) : StopPriceFor(ORDER_TYPE_BUY, buyPx, buySl);
+      const bool sellLevel = InpNoStop ? RiskLevel(ORDER_TYPE_SELL, sellPx, sellSl) : StopPriceFor(ORDER_TYPE_SELL, sellPx, sellSl);
+      if(buyLevel)
+         buyLots = CapLotsForRisk(base, ORDER_TYPE_BUY, buyPx, buySl);
+      else if(InpNoStop)
+         buyLots = base;
+      if(sellLevel)
+         sellLots = CapLotsForRisk(base, ORDER_TYPE_SELL, sellPx, sellSl);
+      else if(InpNoStop)
+         sellLots = base;
    }
 
    Comment(EnumToString(g_tf), "  ", DirectionText(),
@@ -1259,7 +1362,8 @@ void UpdateComment(const datetime bar)
            "   buy ", (buyLots < 0.0 ? "-" : DoubleToString(buyLots, 2)),
            "   sell ", (sellLots < 0.0 ? "-" : DoubleToString(sellLots, 2)),
            "   exit Profit only",
-           "   trail ", DoubleToString(InpTrailPercent, 2), "%\n",
+           InpNoStop ? "   stop none" : "\n   trail " + DoubleToString(InpTrailPercent, 2) + "%",
+           InpMaxHoldHours > 0 ? "   expire " + IntegerToString(InpMaxHoldHours) + " h\n" : "\n",
            "Buy stop   ", (haveChannel ? DoubleToString(hh, DigitsSym()) : "-"), "\n",
            "Sell stop  ", (haveChannel ? DoubleToString(ll, DigitsSym()) : "-"), "\n",
            "Entries today  ", IntegerToString(EntriesToday()), " / ", IntegerToString(g_maxEntries), "\n",
