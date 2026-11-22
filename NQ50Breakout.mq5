@@ -8,12 +8,13 @@
 //| Short:     sell stop at the lowest low of the last 50 bars       |
 //| Direction: long only, short only, or both                       |
 //| Exit:      after the entry bar has closed, and only if the last |
-//|            closed M1 bar finished in profit. A live tick is not |
-//|            a profit signal.                                      |
+//|            closed signal candle printed with the trade and      |
+//|            finished beyond the entry. A live tick is not a      |
+//|            profit signal.                                        |
 //| Stop:      previous candle, or none. Trail is a percent of price |
 //| Cap:       2 entries per day                                     |
 //| Brake:     market-close every position after a 9000 daily drop  |
-//| Risk:      cap each order so the stop risks at most an input % |
+//| Risk:      cap each order so the stop risks at most an input % of its margin |
 //|                                                                  |
 //| The channel uses the last 50 closed bars of the signal timeframe.|
 //| The forming bar is not included. A gap through a level fills    |
@@ -26,9 +27,9 @@
 //| 1-minute OHLC or real ticks so stops can fill inside the bar.   |
 //+------------------------------------------------------------------+
 #property copyright "Onlybreakout"
-#property version   "1.29"
+#property version   "1.35"
 #property description "50-bar breakout. Buy stop at the channel high, sell stop at the channel low."
-#property description "Direction is long only, short only, or both. Profit exit waits for a closed M1 bar."
+#property description "Direction is long only, short only, or both. Profit exit waits for a closed signal candle in profit."
 
 #include <Trade/Trade.mqh>
 
@@ -48,10 +49,11 @@ input ENUM_NQ_DIRECTION InpDirection = NQ_DIR_BOTH; // Trade direction
 
 input group "=== Trade ==="
 input double InpLots               = 1.0;     // Volume, lots
-input double InpMaxRiskPercent     = 5.0;     // Max loss per order, percent of equity
+input double InpMaxRiskPercent     = 5.0;     // Max loss per order, percent of margin
 input double InpTrailPercent       = 0.0;     // Trailing stop, percent of price (0 = off)
 input bool   InpNoStop             = false;   // No stop loss
 input int    InpMaxHoldHours       = 0;       // Close after this many hours (0 = off)
+input bool   InpHeartbeat          = true;    // Hourly heartbeat, open and close the minimum lot
 input bool   InpOverclock          = false;   // Overclock, use the input volume above the floor
 input double InpEquityFloor        = 180000.0; // Equity floor for sizing
 input ulong  InpMagic              = 50302026;
@@ -78,12 +80,13 @@ datetime g_brakeLoggedDay  = 0;
 ulong    g_trailTicket    = 0;
 double   g_trailBest      = 0.0;
 datetime g_trailMinute    = 0;
+datetime g_heartbeatHour  = 0;
 string   g_lastLog         = "";
 
 // Equity sizing is applied to the lot input.
 const double EQUITY_CAP  = 210000.0;
 const double EQUITY_UNIT = 6000.0;
-const double SIZE_FACTOR = 0.35;
+const double SIZE_DIVISOR = 10000.0;
 const double DAILY_DRAWDOWN_LIMIT = 9000.0;
 
 //+------------------------------------------------------------------+
@@ -101,7 +104,7 @@ double SizeFactor()
    if(InpOverclock)
       return 1.0;
    const double capped = (equity > EQUITY_CAP ? EQUITY_CAP : equity);
-   return (capped - InpEquityFloor) / EQUITY_UNIT * SIZE_FACTOR;
+   return (capped - InpEquityFloor) / SIZE_DIVISOR;
 }
 
 //+------------------------------------------------------------------+
@@ -183,6 +186,7 @@ int OnInit()
    g_trailTicket = 0;
    g_trailBest = 0.0;
    g_trailMinute = 0;
+   g_heartbeatHour = 0;
    g_lastLog = "";
    ConfigureTrade();
 
@@ -191,16 +195,17 @@ int OnInit()
          " bars, max ", g_maxEntries,
          " entries/day, day resets at ", g_dayReset, ":00.",
          " Direction ", DirectionText(),
-         InpNoStop ? ". No stop loss. Exit only after a closed M1 bar in profit"
+         InpNoStop ? ". No stop loss. Exit only after the signal candle closes with the trade and beyond the entry"
                    : ". Stop is the previous candle. Trail " + DoubleToString(InpTrailPercent, 2)
-                     + "% of price. Exit only after a closed M1 bar in profit",
+                     + "% of price. Exit only after the signal candle closes with the trade and beyond the entry",
          InpMaxHoldHours > 0 ? ". Close after " + IntegerToString(InpMaxHoldHours) + " hours." : ". No time exit.",
+         InpHeartbeat ? ". Hourly heartbeat on." : ". Hourly heartbeat off.",
          ". Equity ", DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2),
          ", ratio ", DoubleToString(EquityRatio(), 3),
          ", factor ", DoubleToString(SizeFactor(), 3),
          ", lots ", DoubleToString(EffectiveLotsRaw(), 2),
          " from input ", DoubleToString(InpLots, 2),
-         ". Risk cap ", DoubleToString(InpMaxRiskPercent, 1), "% of equity.",
+         ". Risk cap ", DoubleToString(InpMaxRiskPercent, 1), "% of margin.",
          " Emergency brake at ", DoubleToString(DAILY_DRAWDOWN_LIMIT, 0), " daily drawdown.");
    return INIT_SUCCEEDED;
 }
@@ -380,6 +385,112 @@ bool EmergencyBrake()
 }
 
 //+------------------------------------------------------------------+
+ulong HeartbeatMagic()
+{
+   return g_magic + 1;
+}
+
+//+------------------------------------------------------------------+
+double HeartbeatLots()
+{
+   const double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   const double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   if(minLot <= 0.0)
+      return 0.0;
+   double lots = minLot;
+   if(step > 0.0)
+      lots = MathCeil(minLot / step - 1e-8) * step;
+   if(lots < minLot)
+      lots = minLot;
+   return NormalizeDouble(lots, 8);
+}
+
+//+------------------------------------------------------------------+
+int HeartbeatPositions(ulong &tickets[])
+{
+   ArrayResize(tickets, 0);
+   const ulong magic = HeartbeatMagic();
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      const ulong ticket = PositionGetTicket(i);
+      if(ticket == 0)
+         continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+         continue;
+      if((ulong)PositionGetInteger(POSITION_MAGIC) != magic)
+         continue;
+      const int n = ArraySize(tickets);
+      ArrayResize(tickets, n + 1);
+      tickets[n] = ticket;
+   }
+   return ArraySize(tickets);
+}
+
+//+------------------------------------------------------------------+
+bool CloseHeartbeatPositions()
+{
+   ulong tickets[];
+   if(HeartbeatPositions(tickets) == 0)
+      return true;
+
+   g_trade.SetExpertMagicNumber(HeartbeatMagic());
+   bool allClosed = true;
+   for(int i = 0; i < ArraySize(tickets); i++)
+   {
+      if(!g_trade.PositionClose(tickets[i]))
+      {
+         allClosed = false;
+         LogOnce("NQ50 heartbeat close failed: " + g_trade.ResultRetcodeDescription());
+      }
+   }
+   g_trade.SetExpertMagicNumber(g_magic);
+   return allClosed;
+}
+
+//+------------------------------------------------------------------+
+void Heartbeat()
+{
+   if(!InpHeartbeat)
+      return;
+   if(AccountInfoInteger(ACCOUNT_MARGIN_MODE) != ACCOUNT_MARGIN_MODE_RETAIL_HEDGING)
+   {
+      LogOnce("NQ50 heartbeat needs a hedging account.");
+      return;
+   }
+   if(!TradingAllowed())
+      return;
+
+   ulong open[];
+   if(HeartbeatPositions(open) > 0)
+   {
+      CloseHeartbeatPositions();
+      return;
+   }
+
+   const datetime now = TimeCurrent();
+   const datetime hour = now - (now % 3600);
+   if(g_heartbeatHour == hour)
+      return;
+
+   const double lots = HeartbeatLots();
+   if(lots <= 0.0)
+      return;
+
+   g_trade.SetExpertMagicNumber(HeartbeatMagic());
+   const bool opened = g_trade.Buy(lots, _Symbol, 0.0, 0.0, 0.0, "NQ50 heartbeat");
+   g_trade.SetExpertMagicNumber(g_magic);
+   if(!opened)
+   {
+      LogOnce("NQ50 heartbeat open failed: " + g_trade.ResultRetcodeDescription());
+      return;
+   }
+
+   g_heartbeatHour = hour;
+   if(CloseHeartbeatPositions())
+      Print("NQ50 heartbeat ", DoubleToString(lots, 2), " opened and closed.");
+}
+
+//+------------------------------------------------------------------+
 void OnTick()
 {
    const datetime bar = iTime(_Symbol, g_tf, 0);
@@ -400,6 +511,7 @@ void OnTick()
    }
    CloseIfHeldFromPriorBar(bar);
    CloseIfExpired();
+   Heartbeat();
 
    if(HasOurPosition())
    {
@@ -632,7 +744,10 @@ double CapLotsForRisk(const double lots, const ENUM_ORDER_TYPE side, const doubl
    if(perLot <= 0.0)
       return 0.0;
 
-   const double maxLoss = AccountInfoDouble(ACCOUNT_EQUITY) * InpMaxRiskPercent / 100.0;
+   double margin = 0.0;
+   if(!OrderCalcMargin(side, _Symbol, lots, entry, margin) || margin <= 0.0)
+      return 0.0;
+   const double maxLoss = margin * InpMaxRiskPercent / 100.0;
    if(maxLoss <= 0.0)
       return 0.0;
 
@@ -661,7 +776,7 @@ void ReportRiskSize(const string side, const double base, const double lots,
    if(lots <= 0.0)
    {
       LogOnce("NQ50 " + side + " skipped. The stop would risk more than "
-              + DoubleToString(InpMaxRiskPercent, 1) + "% of equity.");
+              + DoubleToString(InpMaxRiskPercent, 1) + "% of margin.");
       return;
    }
    if(lots + 1e-8 >= base)
@@ -852,18 +967,24 @@ ulong FindPending(const ENUM_ORDER_TYPE type)
 }
 
 //+------------------------------------------------------------------+
-bool ClosedM1BarInProfit(const bool isBuy, const double openPrice, const datetime opened, datetime &closedBar, double &closedPrice)
+bool ClosedSignalBarTakesProfit(const bool isBuy, const double openPrice, const datetime opened, datetime &closedBar, double &closedPrice)
 {
-   closedBar = iTime(_Symbol, PERIOD_M1, 1);
-   closedPrice = iClose(_Symbol, PERIOD_M1, 1);
-   if(closedBar <= 0 || closedPrice <= 0.0)
+   closedBar = iTime(_Symbol, g_tf, 1);
+   closedPrice = iClose(_Symbol, g_tf, 1);
+   const double candleOpen = iOpen(_Symbol, g_tf, 1);
+   if(closedBar <= 0 || closedPrice <= 0.0 || candleOpen <= 0.0)
    {
-      LogOnce("Profit exit is waiting for a closed M1 bar.");
+      LogOnce("Profit exit is waiting for a closed " + EnumToString(g_tf) + " candle.");
       return false;
    }
 
-   // Shift 1 has finished. A bar that ended at or before the fill cannot confirm the trade.
-   if(closedBar + PeriodSeconds(PERIOD_M1) <= opened)
+   // Shift 1 has finished. A candle that ended at or before the fill cannot confirm the trade.
+   if(closedBar + PeriodSeconds(g_tf) <= opened)
+      return false;
+
+   // A buy needs a green candle. A sell needs a candle that closed down.
+   const bool printedWithTrade = isBuy ? (closedPrice > candleOpen) : (closedPrice < candleOpen);
+   if(!printedWithTrade)
       return false;
 
    const double spread = SymbolInfoDouble(_Symbol, SYMBOL_ASK) - SymbolInfoDouble(_Symbol, SYMBOL_BID);
@@ -885,8 +1006,9 @@ void CloseIfHeldFromPriorBar(const datetime barOpen)
       if(opened >= barOpen)
          continue;
 
-      // The signal candle after the entry bar must have closed. Profit is then
-      // read from the last closed M1 bar, never from the forming bar's tick.
+      // The candle after the entry bar must have closed. That latest closed
+      // signal candle must have printed with the trade and finished beyond
+      // the entry. The forming candle is ignored.
       const int shift = iBarShift(_Symbol, g_tf, opened, false);
       if(shift < 2)
          continue;
@@ -895,11 +1017,12 @@ void CloseIfHeldFromPriorBar(const datetime barOpen)
       const double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
       datetime closedBar = 0;
       double closedPrice = 0.0;
-      if(!ClosedM1BarInProfit(isBuy, openPrice, opened, closedBar, closedPrice))
+      if(!ClosedSignalBarTakesProfit(isBuy, openPrice, opened, closedBar, closedPrice))
          continue;
 
       if(g_trade.PositionClose(tickets[i]))
-         Print("NQ50 exit on closed M1 bar ", TimeToString(closedBar, TIME_DATE | TIME_MINUTES),
+         Print("NQ50 exit on closed ", EnumToString(g_tf), " candle ",
+               TimeToString(closedBar, TIME_DATE | TIME_MINUTES),
                " close ", DoubleToString(closedPrice, DigitsSym()),
                ", in profit. Ticket ", (string)tickets[i],
                " price ", DoubleToString(g_trade.ResultPrice(), DigitsSym()));
@@ -1319,8 +1442,9 @@ void UpdateComment(const datetime bar)
       action = "Emergency brake: daily drawdown limit hit";
    else if(HasOurPosition())
    {
-      action = InpNoStop ? "Exit only after a closed M1 bar in profit"
-                         : "Exit only after a closed M1 bar in profit, unless the stop is hit first";
+      action = "Exit only after the signal candle closes with the trade and beyond the entry";
+      if(!InpNoStop)
+         action += ", unless the stop is hit first";
       if(InpMaxHoldHours > 0)
          action += ". Close after " + IntegerToString(InpMaxHoldHours) + " hours";
    }
@@ -1358,12 +1482,13 @@ void UpdateComment(const datetime bar)
            "  ratio ", DoubleToString(EquityRatio(), 2), "\n",
            "Lots ", DoubleToString(NormalizedLots(), 2),
            " (input ", DoubleToString(InpLots, 2), ")",
-           "   risk cap ", DoubleToString(InpMaxRiskPercent, 1), "%",
+           "   risk cap ", DoubleToString(InpMaxRiskPercent, 1), "% of margin",
            "   buy ", (buyLots < 0.0 ? "-" : DoubleToString(buyLots, 2)),
            "   sell ", (sellLots < 0.0 ? "-" : DoubleToString(sellLots, 2)),
            "   exit Profit only",
            InpNoStop ? "   stop none" : "\n   trail " + DoubleToString(InpTrailPercent, 2) + "%",
-           InpMaxHoldHours > 0 ? "   expire " + IntegerToString(InpMaxHoldHours) + " h\n" : "\n",
+           InpMaxHoldHours > 0 ? "   expire " + IntegerToString(InpMaxHoldHours) + " h" : "",
+           InpHeartbeat ? "   heartbeat on\n" : "\n",
            "Buy stop   ", (haveChannel ? DoubleToString(hh, DigitsSym()) : "-"), "\n",
            "Sell stop  ", (haveChannel ? DoubleToString(ll, DigitsSym()) : "-"), "\n",
            "Entries today  ", IntegerToString(EntriesToday()), " / ", IntegerToString(g_maxEntries), "\n",
